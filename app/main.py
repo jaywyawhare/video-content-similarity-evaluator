@@ -58,9 +58,47 @@ Instrumentator().instrument(app).expose(app)
 async def add_request_id(request: Request, call_next):
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+    start_time = time.time()
+
+    # Log request details
+    logger.info(
+        f"Incoming {request.method} request",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "endpoint": str(request.url.path),
+            "client_ip": request.client.host if request.client else None,
+            "user_agent": request.headers.get("user-agent"),
+        },
+    )
+
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+
+        # Log response details
+        logger.info(
+            f"Request completed with status {response.status_code}",
+            extra={
+                "request_id": request_id,
+                "status_code": response.status_code,
+                "duration": duration,
+            },
+        )
+
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as e:
+        logger.error(
+            "Request failed",
+            extra={
+                "request_id": request_id,
+                "error": str(e),
+                "duration": time.time() - start_time,
+            },
+            exc_info=True,
+        )
+        raise
 
 
 @app.on_event("startup")
@@ -225,109 +263,115 @@ async def upload_video(video: UploadFile = File(...), request: Request = None):
 @app.post("/rate_videos/", response_model=RatingResponse)
 async def rate_videos(request: VideoRatingRequest, req: Request = None):
     request_id = getattr(req.state, "request_id", str(uuid.uuid4()))
-    logger.info(
-        "Starting video rating",
-        extra={
-            "request_id": request_id,
-            "master_url": str(request.master_url),
-            "candidate_count": len(request.candidate_urls),
-            "endpoint": "/rate_videos",
-        },
-    )
-    files_to_cleanup = []
-    try:
-        # Validate URLs
-        if not all(
-            str(url).startswith("s3://")
-            for url in [request.master_url] + request.candidate_urls
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid S3 URL format",
-                headers={"X-Error-Code": "INVALID_URL_FORMAT"},
-            )
 
-        s3_service = S3Service()
-        # Initialize results list with VideoScore objects for each candidate
-        results = [
-            {
-                "url": str(url),
-                "keyword_coverage": 0.0,
-                "content_similarity": 0.0,
-                "filler_word_penalty": 0.0,
-                "semantic_similarity": 0.0,
-                "aggregate_score": 0.0,
-                "error": None,
-            }
-            for url in request.candidate_urls
-        ]
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Process master video
-            master_video_path = os.path.join(temp_dir, "master.mp4")
-            try:
-                s3_service.download_file(str(request.master_url), master_video_path)
-                master_audio_path = await AudioService().convert_video_to_audio(
-                    master_video_path
-                )
-                files_to_cleanup.extend([master_video_path, master_audio_path])
-                master_transcript = await TranscriptionService().transcribe(
-                    master_audio_path
-                )
-
-                for idx, candidate_url in enumerate(request.candidate_urls):
-                    try:
-                        candidate_video_path = os.path.join(
-                            temp_dir, f"candidate_{idx}.mp4"
-                        )
-                        files_to_cleanup.append(candidate_video_path)
-                        s3_service.download_file(
-                            str(candidate_url), candidate_video_path
-                        )
-                        candidate_audio_path = (
-                            await AudioService().convert_video_to_audio(
-                                candidate_video_path
-                            )
-                        )
-                        files_to_cleanup.append(candidate_audio_path)
-                        candidate_transcript = await TranscriptionService().transcribe(
-                            candidate_audio_path
-                        )
-
-                        scores = RatingService().calculate_scores(
-                            master_transcript, candidate_transcript
-                        )
-                        results[idx].update(scores)
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing candidate {candidate_url}: {str(e)}",
-                            exc_info=True,
-                        )
-                        results[idx].update(
-                            {"error": str(e), "error_code": "PROCESSING_ERROR"}
-                        )
-                        continue
-
-            except Exception as e:
-                logger.error(f"Error processing master video: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail=str(e))
-
-        return RatingResponse(results=results)
-
-    except Exception as e:
-        logger.error(
-            "Error processing video rating request",
-            extra={"request_id": req.state.request_id, "error": str(e)},
-            exc_info=True,
+    with logger.perf_track("rate_videos"):
+        logger.info(
+            "Starting video rating",
+            extra={
+                "request_id": request_id,
+                "master_url": str(request.master_url),
+                "candidate_count": len(request.candidate_urls),
+                "endpoint": "/rate_videos",
+            },
         )
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for file_path in files_to_cleanup:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception as e:
-                logger.error(f"Error cleaning up file {file_path}: {str(e)}")
+        files_to_cleanup = []
+        try:
+            # Validate URLs
+            if not all(
+                str(url).startswith("s3://")
+                for url in [request.master_url] + request.candidate_urls
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid S3 URL format",
+                    headers={"X-Error-Code": "INVALID_URL_FORMAT"},
+                )
+
+            s3_service = S3Service()
+            # Initialize results list with VideoScore objects for each candidate
+            results = [
+                {
+                    "url": str(url),
+                    "keyword_coverage": 0.0,
+                    "content_similarity": 0.0,
+                    "filler_word_penalty": 0.0,
+                    "semantic_similarity": 0.0,
+                    "aggregate_score": 0.0,
+                    "error": None,
+                }
+                for url in request.candidate_urls
+            ]
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Process master video
+                master_video_path = os.path.join(temp_dir, "master.mp4")
+                try:
+                    s3_service.download_file(str(request.master_url), master_video_path)
+                    master_audio_path = await AudioService().convert_video_to_audio(
+                        master_video_path
+                    )
+                    files_to_cleanup.extend([master_video_path, master_audio_path])
+                    master_transcript = await TranscriptionService().transcribe(
+                        master_audio_path
+                    )
+
+                    for idx, candidate_url in enumerate(request.candidate_urls):
+                        try:
+                            candidate_video_path = os.path.join(
+                                temp_dir, f"candidate_{idx}.mp4"
+                            )
+                            files_to_cleanup.append(candidate_video_path)
+                            s3_service.download_file(
+                                str(candidate_url), candidate_video_path
+                            )
+                            candidate_audio_path = (
+                                await AudioService().convert_video_to_audio(
+                                    candidate_video_path
+                                )
+                            )
+                            files_to_cleanup.append(candidate_audio_path)
+                            candidate_transcript = (
+                                await TranscriptionService().transcribe(
+                                    candidate_audio_path
+                                )
+                            )
+
+                            scores = RatingService().calculate_scores(
+                                master_transcript, candidate_transcript
+                            )
+                            results[idx].update(scores)
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing candidate {candidate_url}: {str(e)}",
+                                exc_info=True,
+                            )
+                            results[idx].update(
+                                {"error": str(e), "error_code": "PROCESSING_ERROR"}
+                            )
+                            continue
+
+                except Exception as e:
+                    logger.error(
+                        f"Error processing master video: {str(e)}", exc_info=True
+                    )
+                    raise HTTPException(status_code=500, detail=str(e))
+
+            return RatingResponse(results=results)
+
+        except Exception as e:
+            logger.error(
+                "Error processing video rating request",
+                extra={"request_id": req.state.request_id, "error": str(e)},
+                exc_info=True,
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            for file_path in files_to_cleanup:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    logger.error(f"Error cleaning up file {file_path}: {str(e)}")
 
 
 if __name__ == "__main__":

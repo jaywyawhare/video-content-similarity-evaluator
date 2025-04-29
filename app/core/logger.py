@@ -2,6 +2,8 @@ import logging
 import json
 from datetime import datetime
 from typing import Any, Dict
+import time
+import traceback
 
 
 class JsonFormatter(logging.Formatter):
@@ -15,19 +17,34 @@ class JsonFormatter(logging.Formatter):
             "module": record.module,
             "function": record.funcName,
             "line": record.lineno,
+            "process_id": record.process,
+            "thread_id": record.thread,
         }
 
-        # Add extra fields from record
+        # Add execution time if available
+        if hasattr(record, "duration"):
+            log_obj["duration_ms"] = round(record.duration * 1000, 2)
+
+        # Add request context
         if hasattr(record, "request_id"):
             log_obj["request_id"] = record.request_id
+        if hasattr(record, "endpoint"):
+            log_obj["endpoint"] = record.endpoint
+        if hasattr(record, "method"):
+            log_obj["method"] = record.method
 
-        # Add exception info if present
+        # Add exception info with stack trace
         if record.exc_info:
-            log_obj["exception"] = self.formatException(record.exc_info)
+            exc_type, exc_value, exc_tb = record.exc_info
+            log_obj["exception"] = {
+                "type": exc_type.__name__ if exc_type else None,
+                "message": str(exc_value),
+                "stacktrace": traceback.format_exception(*record.exc_info),
+            }
 
         # Add any extra attributes
-        if record.__dict__.get("extras"):
-            log_obj.update(record.__dict__["extras"])
+        if hasattr(record, "extras"):
+            log_obj.update(record.extras)
 
         return json.dumps(log_obj)
 
@@ -59,6 +76,30 @@ class RequestLogging:
         self.logger.removeFilter(self.filter)
 
 
+class PerformanceLogging:
+    """Context manager for tracking execution time"""
+
+    def __init__(self, logger, operation: str):
+        self.logger = logger
+        self.operation = operation
+        self.start_time = None
+
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration = time.time() - self.start_time
+        self.logger.info(
+            f"{self.operation} completed",
+            extra={
+                "operation": self.operation,
+                "duration": duration,
+                "success": exc_type is None,
+            },
+        )
+
+
 def get_logger(name: str) -> logging.Logger:
     """Get a logger instance with JSON formatting"""
     logger = logging.getLogger(name)
@@ -72,19 +113,22 @@ def get_logger(name: str) -> logging.Logger:
         # Set base logging level
         logger.setLevel(logging.INFO)
 
-        # Add a method to log with extra fields
         def log_with_context(
             self, level: int, msg: str, request_id: str = None, **kwargs
         ):
             """Log with request context"""
+            extras = kwargs.pop("extra", {})
             if request_id:
                 with RequestLogging(self, request_id):
-                    self.log(level, msg, **kwargs)
+                    if "duration" in kwargs:
+                        extras["duration"] = kwargs.pop("duration")
+                    self.log(level, msg, extra=extras, **kwargs)
             else:
-                self.log(level, msg, **kwargs)
+                self.log(level, msg, extra=extras, **kwargs)
 
         logger.log_with_context = lambda *args, **kwargs: log_with_context(
             logger, *args, **kwargs
         )
+        logger.perf_track = lambda op: PerformanceLogging(logger, op)
 
     return logger
